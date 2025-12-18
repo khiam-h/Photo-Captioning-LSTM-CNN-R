@@ -27,4 +27,4 @@ An image captioning model trained using **TensorFlow in R**, combining a **CNN e
 - Better beam search decoding
 
 ## Report
-[text](Team06_SMLProject2023.html)
+<Team06_SMLProject2023.html>
