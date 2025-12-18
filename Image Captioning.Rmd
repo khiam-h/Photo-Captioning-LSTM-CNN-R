@@ -1,0 +1,416 @@
+---
+title: "Image Captioning RNN Sample Code"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+library(tidyverse)
+library(keras)
+library(dplyr)
+library(tensorflow)
+library(magick)
+library(purrr)
+library(stringr)
+library(glue)
+library(rlang)
+library(data.table)
+library(ramify)
+library(word2vec)
+
+```
+
+```{r}
+# Load the captions from a text file
+#setwd("C:\Users\...") #sets working directory 
+
+captions_lines <- readLines("caption tiny.txt") ####change when neccessary
+
+
+
+# Split each line into filename and caption
+captions_df <- data.frame(
+  filename = character(),
+  caption = character(),
+  stringsAsFactors = FALSE
+)
+
+num_desc <- length(captions_lines)
+for (i in 1:num_desc) {
+  line <- captions_lines[i]
+  caption_parts <- strsplit(line, ",")[[1]]
+  filename <- trimws(caption_parts[1])
+  caption <- trimws(caption_parts[2])
+  captions_df[i, "filename"] <- filename
+  captions_df[i, "caption"] <- caption
+}
+
+# Define a function to preprocess the captions, and adding start and end words for recognition
+preprocess_caption <- function(caption) {
+  # Convert to lowercase
+  caption <- tolower(caption)
+  
+  # Remove punctuations and special characters
+  caption <- gsub("[[:punct:][:digit:]]", " ", caption)
+  
+  # Remove extra white spaces
+  caption <- gsub("\\s+", " ", caption)
+  
+  # Remove leading and trailing white spaces
+  caption <- trimws(caption)
+  
+  #add start token and end token to caption
+  caption <- paste0("<start> ", caption, " <end>")
+  
+  return(caption)
+}
+
+# Apply the preprocess_caption function to the captions
+captions_df$caption <- sapply(captions_df$caption, preprocess_caption)
+
+```
+
+```{r}
+# Split the dataset into training and validation sets
+set.seed(123)
+train_pct <- 0.8
+train_indices <- sample(nrow(captions_df), round(train_pct * nrow(captions_df)))
+train_capdf <- captions_df[train_indices, ] #training set of captions
+val_capdf <- captions_df[-train_indices, ] #validation set of captions
+```
+
+```{r}
+# Create a vocabulary of words from the captions
+vocab_size <- 5000
+tokenizer <- text_tokenizer(num_words = vocab_size,
+                            oov_token = "<unk>",
+                            filters = '!"#$%&()*+.,-/:;=?@[\\]^_`{|}~ ')
+tokenizer %>% fit_text_tokenizer(captions_df$caption)
+
+# Convert the captions to sequences of integers using tokenizer
+train_sequences <- texts_to_sequences(tokenizer, train_capdf$caption)
+val_sequences <- texts_to_sequences(tokenizer, val_capdf$caption)
+
+#match an image to an index matching the sequence in train_seq
+id <- 1
+img_id <- data.frame(image="empty", id = 1:length(train_capdf$filename))
+for (image_name in train_capdf$filename){
+  img_id$image[id] <- image_name
+  id <- id+1
+}
+
+# Initialise the maximum length of a caption
+caption_lengths <- map(
+  captions_df$caption[1:num_desc],
+  function(c) str_split(c," ")[[1]] %>% length()
+  ) %>% unlist()
+max_length <- fivenum(caption_lengths)[5]
+
+#Initialise padding variable
+tokenizer$word_index["<pad>"] <- 0
+
+
+#generate one hot encoded captions as input and true label
+#replace train_sequences and train_featuresdf with val_sequences and val_featuresdf respectively
+# Create a function that maps a list of the one hot encoded captions and extracted image features to a LAAAAARGE list 
+data_generator <- function(train_sequences, train_featuresdf,img_id){
+  #captions_df, 
+  in_img <- data.frame()
+  in_cap <- data.frame()
+  true_cap <- data.frame()
+  
+  for (itname in train_featuresdf$file_name){
+    photo <- train_featuresdf[train_featuresdf$file_name==itname,]
+    photo <- photo[1,-1]
+    seq_id <- img_id[img_id$image==itname,]$id 
+    
+    if (is.data.frame(seq_id)){
+      seq_id <- sample_n(seq_id,1)$id
+    }
+    
+    seq <- train_sequences[seq_id]
+    for (i in (2:length(seq[[1]]))){
+      out_seq <- seq[[1]][i]
+      in_seq <- seq[[1]][1:i-1]
+      # out_seq <- seq[[1]][5]
+      # in_seq <- seq[[1]][1:i-1]
+      #padding in_seq
+      in_seq <- pad_sequences(list(in_seq),
+                              maxlen = max_length,
+                              padding = "post",
+                              truncating = "post")
+      #one hot encode the out sequence
+      out_seq <- to_categorical(list(out_seq), num_classes = vocab_size)
+      
+      #store in array
+      in_img <- rbind(in_img, photo)
+      in_cap <- rbind(in_cap, in_seq)
+      true_cap <- rbind(true_cap, out_seq)
+    }
+  }
+  in_img <- as.matrix(in_img)
+  in_cap <- as.matrix(in_cap)
+  true_cap <- as.matrix(true_cap)
+  return (list(list(in_img,in_cap), true_cap))
+}
+```
+
+```{r}
+# Define path to image directory
+dir_path <- "tiny test" #for original ##### change here if needed
+
+
+# Get list of image file names
+file_names <- list.files(dir_path, pattern = ".jpg$", full.names = TRUE)
+filename_df <- as.data.frame(file_names)
+```
+
+```{r}
+#Create feature extraction model using a CNN
+model_v3 <- application_inception_v3()
+layer_name <- "avg_pool"
+feat_extraction_model_v3 <- keras_model(inputs = model_v3$layers[[1]]$input, outputs = model_v3$get_layer(layer_name)$output)
+feat_extraction_model_v3%>%summary
+```
+```{r}
+#Create function to process images and extract features
+imvec_feat_v3 <- function(img_path){
+  img_raw <- image_load(img_path, target_size = c(299L,299L))
+  img <- image_to_array(img_raw)
+  img <- array_reshape(img, c(1,dim(img)))
+  img <- inception_v3_preprocess_input(img)
+  #
+  feats <- feature_extracted <- as.data.frame(feat_extraction_model_v3 %>% predict(img))
+  return (feats)
+}
+
+# imvec_feat_v3 <- function(img_path){
+#   img <- tf$keras$utils$load_img(img_path)%>%
+#     tf$image$decode_jpeg(channels = 3L)%>%
+#     tf$image$resize(c(299L,299L))%>%
+#     inception_v3_preprocess_input()
+#   feats <- feature_extracted <- as.data.frame(feat_extraction_model_v3 %>% predict(img))
+#   return (feats)
+# }
+#tf$io$decode_jpeg
+```
+
+
+```{r echo=TRUE, results = 'hide'}
+rm(features) #removing any instance of features dataframe
+rm(val_feat) #remove any instance of validation features dataframe
+features <- data.frame()
+val_feat <- data.frame()
+
+# Seperate file names into training set and validation set
+train_img_indices <- sample(nrow(train_capdf), (nrow(train_capdf)/5))
+val_img_indices <- sample(nrow(val_capdf), (nrow(val_capdf)/5))
+train_img_file <- train_capdf[train_img_indices,]$filename
+val_img_file <- val_capdf[val_img_indices,]$filename
+```
+
+
+```{r echo=TRUE, results = 'hide'}
+#Extract features of training dataset
+for (file_name in train_img_file) {
+  train_img_path <- paste("tiny test", file_name, sep = "/") #for original
+  
+  feature_extracted <- imvec_feat_v3(train_img_path)
+  feature_extracted <- cbind(file_name,feature_extracted)
+  features <- rbind(features,feature_extracted)
+}
+
+#store extracted features to CSV
+file.remove("Extracted features train.csv")
+file.create("Extracted features train.csv")
+write.csv(features, file = "Extracted features train.csv")
+```
+```{r echo=TRUE, results='hide'}
+#Extract the features for the validation images dataset
+for (file_name in val_img_file) {
+  val_img_path <- paste("tiny test", file_name, sep = "/") 
+  
+  feature_extracted <- imvec_feat_v3(val_img_path)
+  feature_extracted <- cbind(file_name,feature_extracted)
+  features <- rbind(features,feature_extracted)
+}
+
+#store extracted features of dataset to CSV
+file.remove("Extracted features val.csv")
+file.create("Extracted features val.csv")
+write.csv(features, file = "Extracted features val.csv")
+```
+
+```{r Echo= TRUE}
+##load dataset for training
+#load features for training
+
+train_featuresdf <- read.csv("Extracted features train.csv") #returns data frame
+train_featuresdf <- train_featuresdf[,-1]
+
+
+#load validation features
+val_featuresdf <- read.csv("Extracted features val.csv")
+val_featuresdf <- train_featuresdf[,-1]
+
+##prepare input dataset for training and validation
+#This portion is the most time consuming
+data_train_in <- data_generator(train_sequences, train_featuresdf, img_id)
+data_val_in <-  data_generator(val_sequences, val_featuresdf, img_id)
+
+#optionally export dataset out for loading in later on
+file.remove("model training input.csv")
+file.create("model training input.csv")
+write.csv(data_train_in, file = "model training input.csv")
+
+file.remove("model validation input.csv")
+file.create("model validation input.csv")
+write.csv(data_val_in, file = "model validation input.csv")
+
+# #loading in of data --> require testing to get the correct format
+# data_train_inload <- as.list(read.csv("model training input.csv"))
+# data_val_inload <- as.list(read.csv("model validation input.csv"))
+```
+
+```{r}
+##feature encoding for RNN
+# for encoder output
+embedding_dim <- 256
+# decoder (LSTM) capacity
+lstm_units <- 256
+# for decoder output
+output_size <- vocab_size #find out
+# number of feature maps gotten from Inception V3
+features_shape <- 2048
+```
+
+```{r}
+###creating RNN model
+## Merging of layers
+
+#Inputs1 takes the input for the image features, with dimension 2048
+inputs1_imgfeat <- layer_input(shape = c(features_shape)) %>%
+  layer_dropout(rate=0.25)
+inputs1 <- inputs1_imgfeat%>% layer_dense(units=lstm_units, activation = "relu")
+
+#inputs2 takes the input for the caption as tokens, with dimension of max_length
+#this portion of the model is the RNN portion which uses LSTM for language modelling
+inputs2_vocab <- layer_input(shape = c(max_length))
+inputs2 <- inputs2_vocab%>%
+  layer_embedding(input_dim = vocab_size, output_dim = embedding_dim, mask_zero = TRUE) %>%
+  layer_dropout(rate = 0.25)%>%
+  layer_lstm(units = lstm_units)#%>%
+  # #layer_dense(units = lstm_units, activation = "relu")%>%
+  #  layer_embedding(input_dim = vocab_size, output_dim = embedding_dim, mask_zero = TRUE, trainable = FALSE) %>%
+  # # layer_dropout(rate=0.25)%>%
+  #  layer_lstm(units = lstm_units)
+
+#combine the layers into a feedforward network
+decoder1 <- #layer_add(inputs1,inputs2)%>%
+  layer_add(inputs1,inputs2)%>%
+  layer_dense(units = 256, activation = "relu") #, activity_regularizer = regularizer_l1(l=0.01)
+dout<- decoder1 %>% 
+  layer_dense(units = vocab_size, activation = "softmax", name = "dout") #, activity_regularizer = regularizer_l1(l=0.01)
+  
+
+
+rnn_model <- keras_model(inputs = c(inputs1_imgfeat,inputs2_vocab), outputs = dout)
+rnn_model%>%summary()
+```
+
+
+```{r Echo=TRUE, results='hide'}
+cx_loss <- function(y_true, y_pred) {
+  mask <- 1 - k_cast(y_true == 0L, dtype = "float32")
+  loss <- tf$nn$softmax_cross_entropy_with_logits(
+    labels = y_true,
+    logits = y_pred
+  ) * mask
+  tf$reduce_mean(loss)
+}
+rnn_model%>%compile(loss= "categorical_crossentropy", optimizer = optimizer_adam(learning_rate=0.0001))
+#conduct fitting of the model
+history_rnn = rnn_model%>% fit(
+  x = data_train_in[[1]], y = data_train_in[[2]],
+  epochs= 20, batch_size=32, validation_split= 0.2, verbose = 2)#, #callbacks = list(keras$callbacks$EarlyStopping(monitor = 'val_loss', patience = 5, restore_best_weights = TRUE)))
+
+```
+
+```{r}
+#plot history
+plot(history_rnn)
+```
+
+
+```{r echo=TRUE, results='hide'}
+##predict an output --> continue tommorrow. how to run individual words instead of add to list
+# uses greedy algorithm to determine the next predicted word
+img_pred <- function(photo, ...) {
+    in_text <-  '<start>'
+    for (i in (1:max_length)){
+        seq_cap <- strsplit(in_text, ' ')
+        sequence <-  texts_to_sequences(tokenizer, seq_cap)
+        sequence <-  pad_sequences(sequence,
+                                   maxlen=max_length,
+                                   padding = "post",
+                                   truncating = "post")
+        
+        
+        yhat <-  rnn_model%>%predict(list(photo,sequence), verbose = 0)
+        yhat <-  argmax(yhat)
+        word <-  seq_to_text(list(list(yhat)))
+        
+        if (word == '<end>'){
+            break
+        }
+        else {
+          in_text <- paste0(in_text,' ',word)
+        }
+        print(in_text)
+    }
+    in_text <- gsub('<start> ', '', in_text)
+    return (in_text)
+}
+
+#validate with an image
+test_path <- "tiny test/1926129518_4350f4f552.jpg"
+test_feat <- as.matrix(imvec_feat_v3(test_path))
+photo <- test_feat
+seq_to_text <- tokenizer$sequences_to_texts
+pred_caption <- img_pred(test_feat, max_length, tokenizer, texts_to_sequences, pad_sequences, rnn_model, seq_to_text)
+actual_cap <- captions_df[captions_df$filename==gsub('tiny test/', '', test_path),]
+```
+
+
+```{r img-with-knitr, echo=FALSE, fig.align='center', out.width='60%'}
+knitr::include_graphics(test_path)
+#add image into rmd
+```
+
+```{r}
+
+actual_cap <- sample_n(actual_cap,1)$caption 
+actual_cap <- gsub('<start> ','',actual_cap)
+actual_cap <- gsub(' <end>','',actual_cap)
+actual_cap <- paste0("Actual Caption: ", actual_cap)
+predicted_cap <- paste0("Predicted: ", pred_caption)
+printlist <- c(actual_cap,predicted_cap)
+for (i in printlist){
+  print(i)
+}
+```
+
+```{}
+length(predicted_cap)
+#evaluate model
+perf = rnn_model %>% evaluate(data_val_in[[1]], data_val_in[[2]])
+print(perf)
+```
+
+For evaluating the model, other than using the in-built keras "evaluate()" function, there is a more specific evaluation metric for Image captioning known as BLEU. 
+Briefly, the BLEU measures the predicted output from 0, indicating a total mismatch, to 1, a complete match. A complete match often means an identical match to a reference, and is unrealistic and unnecessary to obtain 1. A generally higher score close to 1 is desirable.
+
+
